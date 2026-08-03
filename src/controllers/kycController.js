@@ -1,0 +1,144 @@
+const kycService =
+require("../services/kycService");
+
+
+const kycController = {
+
+
+getAll:async(req,res)=>{
+
+try{
+
+const data =
+await kycService.getAll();
+
+res.json({
+success:true,
+data
+});
+
+}catch(error){
+
+res.status(500).json({
+success:false,
+message:error.message
+});
+
+}
+
+},
+
+
+
+getOne:async(req,res)=>{
+
+try{
+
+const data =
+await kycService.getById(req.params.id);
+
+res.json({
+success:true,
+data
+});
+
+
+}catch(error){
+
+res.status(404).json({
+success:false,
+message:error.message
+});
+
+}
+
+},
+
+
+
+create:async(req,res)=>{
+
+try{
+
+const data =
+await kycService.create(req.body);
+
+
+res.status(201).json({
+success:true,
+data
+});
+
+
+}catch(error){
+
+res.status(500).json({
+success:false,
+message:error.message
+});
+
+}
+
+},
+
+
+
+update:async(req,res)=>{
+
+try{
+
+const data =
+await kycService.update(
+req.params.id,
+req.body
+);
+
+
+res.json({
+success:true,
+data
+});
+
+
+}catch(error){
+
+res.status(404).json({
+success:false,
+message:error.message
+});
+
+}
+
+},
+
+
+
+delete:async(req,res)=>{
+
+try{
+
+await kycService.delete(req.params.id);
+
+
+res.json({
+success:true,
+message:"KYC deleted"
+});
+
+
+}catch(error){
+
+res.status(404).json({
+success:false,
+message:error.message
+});
+
+}
+
+}
+
+
+};
+
+
+module.exports = kycController;

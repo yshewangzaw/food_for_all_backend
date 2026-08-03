@@ -1,0 +1,504 @@
+const {
+  WithdrawalRequest,
+  WalletTransaction,
+  User,
+  PaymentMethod,
+  Notification,
+} = require("../models");
+const sequelize = require("../config/database");
+const { Op } = require("sequelize");
+const { getPagination, buildMeta } = require("../utils/pagination");
+const wallet = require("./walletExtendedRepository");
+
+const MIN_WITHDRAWAL = parseFloat(process.env.MIN_WITHDRAWAL_AMOUNT || 100);
+
+const notify = (userId, title, body, t) =>
+  Notification.create(
+    { userId, category: "WITHDRAWAL", title, body, isRead: false },
+    { transaction: t },
+  );
+
+const withdrawalExtendedRepository = {
+  // ---------- relationships ----------
+  getUser: async (id) => {
+    const w = await WithdrawalRequest.findByPk(id);
+    if (!w) throw new Error("Withdrawal request not found");
+    return await User.findByPk(w.userId, {
+      attributes: ["id", "fullName", "email", "phone", "kycStatus"],
+    });
+  },
+
+  getPaymentMethod: async (id) => {
+    const w = await WithdrawalRequest.findByPk(id);
+    if (!w) throw new Error("Withdrawal request not found");
+    return await PaymentMethod.findByPk(w.paymentMethodId);
+  },
+
+  // The lock / debit / refund rows tied to this request
+  getWalletTransactions: async (id) => {
+    const w = await WithdrawalRequest.findByPk(id);
+    if (!w) throw new Error("Withdrawal request not found");
+    return await WalletTransaction.findAll({
+      where: { referenceType: "WITHDRAWAL", referenceId: w.id },
+      order: [["createdAt", "ASC"]],
+    });
+  },
+
+  // ---------- eligibility ----------
+  // Call this before rendering the form so the member never submits
+  // something that is going to be rejected on a rule they can't see.
+  getEligibility: async (userId) => {
+    const user = await User.findByPk(userId, {
+      attributes: ["id", "wallet", "lockedBalance", "kycStatus", "status"],
+    });
+    if (!user) throw new Error("User not found");
+
+    const pending = await WithdrawalRequest.findOne({
+      where: {
+        userId,
+        status: { [Op.in]: ["PENDING", "UNDER_REVIEW", "APPROVED"] },
+      },
+    });
+
+    const available = parseFloat(user.wallet);
+    const reasons = [];
+
+    if (user.status !== "ACTIVE") reasons.push("Your account is not active");
+    if (user.kycStatus !== "APPROVED")
+      reasons.push("KYC must be approved before withdrawing");
+    if (pending) reasons.push("You already have a withdrawal in progress");
+    if (available < MIN_WITHDRAWAL)
+      reasons.push(`Minimum withdrawal is ${MIN_WITHDRAWAL}`);
+
+    return {
+      eligible: reasons.length === 0,
+      reasons,
+      availableBalance: available,
+      lockedBalance: parseFloat(user.lockedBalance || 0),
+      minimumAmount: MIN_WITHDRAWAL,
+      maximumAmount: available,
+      pendingRequest: pending
+        ? { id: pending.id, amount: pending.amount, status: pending.status }
+        : null,
+      kycStatus: user.kycStatus,
+    };
+  },
+
+  // ---------- submit ----------
+  // available -> locked, atomically with the request row.
+  create: async ({ userId, amount, paymentMethodId, accountNumber }) => {
+    const amt = parseFloat(amount);
+    if (isNaN(amt) || amt <= 0) throw new Error("Invalid amount");
+    if (amt < MIN_WITHDRAWAL)
+      throw new Error(`Minimum withdrawal is ${MIN_WITHDRAWAL}`);
+    if (!accountNumber) throw new Error("accountNumber is required");
+
+    const method = await PaymentMethod.findByPk(paymentMethodId);
+    if (!method || !method.isActive)
+      throw new Error("Payment method is not available");
+    if (method.minAmount && amt < parseFloat(method.minAmount))
+      throw new Error(`This channel requires at least ${method.minAmount}`);
+    if (method.maxAmount && amt > parseFloat(method.maxAmount))
+      throw new Error(`This channel allows at most ${method.maxAmount}`);
+
+    const t = await sequelize.transaction();
+    try {
+      const user = await User.findByPk(userId, {
+        transaction: t,
+        lock: t.LOCK.UPDATE,
+      });
+      if (!user) throw new Error("User not found");
+      if (user.status !== "ACTIVE") throw new Error("Account is not active");
+      if (user.kycStatus !== "APPROVED")
+        throw new Error("KYC must be approved before withdrawing");
+
+      const existing = await WithdrawalRequest.findOne({
+        where: {
+          userId,
+          status: { [Op.in]: ["PENDING", "UNDER_REVIEW", "APPROVED"] },
+        },
+        transaction: t,
+      });
+      if (existing) throw new Error("You already have a withdrawal in progress");
+
+      if (parseFloat(user.wallet) < amt) {
+        throw new Error(
+          `Insufficient balance. Available ${parseFloat(user.wallet).toFixed(2)}`,
+        );
+      }
+
+      const request = await WithdrawalRequest.create(
+        {
+          userId,
+          amount: amt,
+          paymentMethodId,
+          accountNumber,
+          status: "PENDING",
+        },
+        { transaction: t },
+      );
+
+      await wallet.postTransaction(
+        {
+          userId,
+          transactionType: "WITHDRAWAL_LOCK",
+          direction: "DEBIT",
+          amount: amt,
+          referenceType: "WITHDRAWAL",
+          referenceId: request.id,
+          description: `Withdrawal #${request.id} submitted — funds locked`,
+          affects: "lock",
+        },
+        t,
+      );
+
+      await notify(
+        userId,
+        "Withdrawal submitted",
+        `Your withdrawal of ${amt} is pending review.`,
+        t,
+      );
+
+      await t.commit();
+      return request;
+    } catch (error) {
+      await t.rollback();
+      throw error;
+    }
+  },
+
+  // ---------- member cancel ----------
+  cancel: async (id, userId) => {
+    const t = await sequelize.transaction();
+    try {
+      const w = await WithdrawalRequest.findByPk(id, {
+        transaction: t,
+        lock: t.LOCK.UPDATE,
+      });
+      if (!w) throw new Error("Withdrawal request not found");
+      if (w.userId !== userId) throw new Error("This is not your withdrawal");
+      if (!["PENDING", "UNDER_REVIEW"].includes(w.status)) {
+        throw new Error(`Cannot cancel a request with status ${w.status}`);
+      }
+
+      await w.update({ status: "CANCELLED" }, { transaction: t });
+
+      await wallet.postTransaction(
+        {
+          userId: w.userId,
+          transactionType: "WITHDRAWAL_REFUND",
+          direction: "CREDIT",
+          amount: w.amount,
+          referenceType: "WITHDRAWAL",
+          referenceId: w.id,
+          description: `Withdrawal #${w.id} cancelled — funds released`,
+          affects: "unlock",
+        },
+        t,
+      );
+
+      await t.commit();
+      return w;
+    } catch (error) {
+      await t.rollback();
+      throw error;
+    }
+  },
+
+  // ---------- admin: claim for review ----------
+  // Stops two admins paying the same request twice.
+  review: async (id, adminId) => {
+    const w = await WithdrawalRequest.findByPk(id);
+    if (!w) throw new Error("Withdrawal request not found");
+    if (w.status !== "PENDING")
+      throw new Error(`Cannot review a request with status ${w.status}`);
+
+    await w.update({
+      status: "UNDER_REVIEW",
+      reviewedById: adminId,
+      reviewedAt: new Date(),
+    });
+    return w;
+  },
+
+  approve: async (id, adminId) => {
+    const t = await sequelize.transaction();
+    try {
+      const w = await WithdrawalRequest.findByPk(id, {
+        transaction: t,
+        lock: t.LOCK.UPDATE,
+      });
+      if (!w) throw new Error("Withdrawal request not found");
+      if (!["PENDING", "UNDER_REVIEW"].includes(w.status)) {
+        throw new Error(`Cannot approve a request with status ${w.status}`);
+      }
+
+      await w.update(
+        { status: "APPROVED", reviewedById: adminId, reviewedAt: new Date() },
+        { transaction: t },
+      );
+
+      await notify(
+        w.userId,
+        "Withdrawal approved",
+        `Your withdrawal of ${w.amount} was approved and is awaiting transfer.`,
+        t,
+      );
+
+      await t.commit();
+      return w;
+    } catch (error) {
+      await t.rollback();
+      throw error;
+    }
+  },
+
+  reject: async (id, adminId, reason) => {
+    if (!reason || !reason.trim())
+      throw new Error("A rejection reason is required");
+
+    const t = await sequelize.transaction();
+    try {
+      const w = await WithdrawalRequest.findByPk(id, {
+        transaction: t,
+        lock: t.LOCK.UPDATE,
+      });
+      if (!w) throw new Error("Withdrawal request not found");
+      if (!["PENDING", "UNDER_REVIEW", "APPROVED"].includes(w.status)) {
+        throw new Error(`Cannot reject a request with status ${w.status}`);
+      }
+
+      await w.update(
+        {
+          status: "REJECTED",
+          rejectionReason: reason.trim(),
+          reviewedById: adminId,
+          reviewedAt: new Date(),
+        },
+        { transaction: t },
+      );
+
+      // release the lock back to available
+      await wallet.postTransaction(
+        {
+          userId: w.userId,
+          transactionType: "WITHDRAWAL_REFUND",
+          direction: "CREDIT",
+          amount: w.amount,
+          referenceType: "WITHDRAWAL",
+          referenceId: w.id,
+          description: `Withdrawal #${w.id} rejected — funds released`,
+          affects: "unlock",
+        },
+        t,
+      );
+
+      await notify(
+        w.userId,
+        "Withdrawal rejected",
+        `Your withdrawal of ${w.amount} was rejected. Reason: ${reason.trim()}`,
+        t,
+      );
+
+      await t.commit();
+      return w;
+    } catch (error) {
+      await t.rollback();
+      throw error;
+    }
+  },
+
+  // ---------- admin: mark paid ----------
+  // The lock is cleared for good here. This is the only place money
+  // actually leaves the system.
+  markPaid: async (id, adminId, { paymentReference, proofImageUrl }) => {
+    if (!paymentReference || !paymentReference.trim()) {
+      throw new Error("paymentReference is required — record the transfer number");
+    }
+
+    const t = await sequelize.transaction();
+    try {
+      const w = await WithdrawalRequest.findByPk(id, {
+        transaction: t,
+        lock: t.LOCK.UPDATE,
+      });
+      if (!w) throw new Error("Withdrawal request not found");
+      if (w.status !== "APPROVED") {
+        throw new Error("Only an APPROVED withdrawal can be marked paid");
+      }
+
+      await w.update(
+        {
+          status: "PAID",
+          paidAt: new Date(),
+          paidById: adminId,
+          paymentReference: paymentReference.trim(),
+          proofImageUrl: proofImageUrl || w.proofImageUrl,
+        },
+        { transaction: t },
+      );
+
+      await wallet.postTransaction(
+        {
+          userId: w.userId,
+          transactionType: "WITHDRAWAL_DEBIT",
+          direction: "DEBIT",
+          amount: w.amount,
+          referenceType: "WITHDRAWAL",
+          referenceId: w.id,
+          description: `Withdrawal #${w.id} paid — ref ${paymentReference.trim()}`,
+          affects: "locked",
+        },
+        t,
+      );
+
+      await notify(
+        w.userId,
+        "Withdrawal paid",
+        `Your withdrawal of ${w.amount} has been paid. Reference: ${paymentReference.trim()}`,
+        t,
+      );
+
+      await t.commit();
+      return w;
+    } catch (error) {
+      await t.rollback();
+      throw error;
+    }
+  },
+
+  bulkMarkPaid: async (items, adminId) => {
+    const results = [];
+    for (const item of items) {
+      try {
+        const w = await withdrawalExtendedRepository.markPaid(item.id, adminId, {
+          paymentReference: item.paymentReference,
+          proofImageUrl: item.proofImageUrl,
+        });
+        results.push({ id: item.id, success: true, status: w.status });
+      } catch (error) {
+        results.push({ id: item.id, success: false, message: error.message });
+      }
+    }
+    return {
+      total: items.length,
+      succeeded: results.filter((r) => r.success).length,
+      failed: results.filter((r) => !r.success).length,
+      results,
+    };
+  },
+
+  // ---------- queues ----------
+  getQueue: async (status = "PENDING") => {
+    return await WithdrawalRequest.findAll({
+      where: { status },
+      include: [
+        {
+          model: User,
+          as: "user",
+          attributes: ["id", "fullName", "phone", "kycStatus", "wallet"],
+        },
+        { model: PaymentMethod, attributes: ["id", "name", "methodType"] },
+      ],
+      order: [["createdAt", "ASC"]], // oldest first — fairness
+    });
+  },
+
+  // Grouped by channel, ready for a bulk bank / telebirr transfer
+  getPayoutBatch: async (date) => {
+    const where = { status: "APPROVED" };
+    if (date) {
+      const start = new Date(date);
+      start.setHours(0, 0, 0, 0);
+      const end = new Date(date);
+      end.setHours(23, 59, 59, 999);
+      where.updatedAt = { [Op.between]: [start, end] };
+    }
+
+    const rows = await WithdrawalRequest.findAll({
+      where,
+      include: [
+        { model: User, as: "user", attributes: ["id", "fullName", "phone"] },
+        { model: PaymentMethod, attributes: ["id", "name", "code", "methodType"] },
+      ],
+      order: [["paymentMethodId", "ASC"], ["createdAt", "ASC"]],
+    });
+
+    const groups = {};
+    for (const r of rows) {
+      const key = r.PaymentMethod ? r.PaymentMethod.code : "UNKNOWN";
+      if (!groups[key]) {
+        groups[key] = {
+          paymentMethod: r.PaymentMethod,
+          count: 0,
+          totalAmount: 0,
+          items: [],
+        };
+      }
+      groups[key].count += 1;
+      groups[key].totalAmount += parseFloat(r.amount);
+      groups[key].items.push({
+        withdrawalId: r.id,
+        memberName: r.user ? r.user.fullName : null,
+        accountNumber: r.accountNumber,
+        amount: parseFloat(r.amount),
+      });
+    }
+
+    return {
+      date: date || null,
+      grandTotal: rows.reduce((s, r) => s + parseFloat(r.amount), 0),
+      totalRequests: rows.length,
+      batches: Object.values(groups),
+    };
+  },
+
+  // ---------- filter (spec 6.2) ----------
+  findFiltered: async (q) => {
+    const { page, limit, offset } = getPagination(q);
+    const where = {};
+
+    if (q.status) where.status = q.status;
+    if (q.userId) where.userId = q.userId;
+    if (q.paymentMethodId) where.paymentMethodId = q.paymentMethodId;
+    if (q.accountNumber)
+      where.accountNumber = { [Op.like]: `%${q.accountNumber}%` };
+
+    if (q.dateFrom || q.dateTo) {
+      where.createdAt = {};
+      if (q.dateFrom) where.createdAt[Op.gte] = new Date(q.dateFrom);
+      if (q.dateTo) where.createdAt[Op.lte] = new Date(q.dateTo);
+    }
+    if (q.paidFrom || q.paidTo) {
+      where.paidAt = {};
+      if (q.paidFrom) where.paidAt[Op.gte] = new Date(q.paidFrom);
+      if (q.paidTo) where.paidAt[Op.lte] = new Date(q.paidTo);
+    }
+    if (q.minAmount || q.maxAmount) {
+      where.amount = {};
+      if (q.minAmount) where.amount[Op.gte] = q.minAmount;
+      if (q.maxAmount) where.amount[Op.lte] = q.maxAmount;
+    }
+
+    const sort = ["createdAt", "amount", "paidAt"].includes(q.sort)
+      ? q.sort
+      : "createdAt";
+    const order = String(q.order).toLowerCase() === "asc" ? "ASC" : "DESC";
+
+    const { rows, count } = await WithdrawalRequest.findAndCountAll({
+      where,
+      include: [
+        { model: User, as: "user", attributes: ["id", "fullName", "phone"] },
+        { model: PaymentMethod, attributes: ["id", "name", "methodType"] },
+      ],
+      order: [[sort, order]],
+      limit,
+      offset,
+      distinct: true,
+    });
+
+    return { data: rows, meta: buildMeta({ count, page, limit }) };
+  },
+};
+
+module.exports = withdrawalExtendedRepository;
